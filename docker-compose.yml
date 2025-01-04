@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  neo4j:
+    image: neo4j:latest
+    container_name: neo4j-kgsearch
+    environment:
+      - NEO4J_AUTH=neo4j/password # Replace with your own username and password
+    ports:
+      - "7474:7474" # HTTP access to the Neo4j browser
+      - "7687:7687" # Bolt protocol for application access
+
+  app:
+    build: .
+    container_name: go-kgsearch
+    depends_on:
+      - neo4j
+    ports:
+      - "8080:8080" # Expose the Go app's port
+    environment:
+      - NEO4J_URI=neo4j://neo4j:7687 # Neo4j Bolt URI for the Go app
+    command: ["./myapp"] # Ensure this matches the Go binary name
