@@ -2,73 +2,94 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"os"
+	"sync"
+	"time"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j/config"
 )
 
-func main() {
-	app := fiber.New()
-	driver := connectToNeo4j()
-
-	defer driver.Close(context.Background())
-
-	app.Get("/search", func(c *fiber.Ctx) error {
-		category := c.Query("category")
-		if category == "" {
-			return c.Status(400).SendString("Category is required")
-		}
-
-		session := driver.NewSession(context.Background(), neo4j.SessionConfig{})
-		defer session.Close(context.Background())
-
-		query := `
-			MATCH (p:Product)-[:BELONGS_TO]->(c:Category {name: $category})
-			RETURN p.name AS name, p.price AS price, p.brand AS brand
-		`
-		result, err := session.ExecuteRead(context.Background(), func(tx neo4j.ManagedTransaction) (any, error) {
-			records, err := tx.Run(context.Background(), query, map[string]any{"category": category})
-			if err != nil {
-				return nil, err
-			}
-
-			var products []map[string]any
-			for records.Next(context.Background()) {
-				// Get record values as []any
-				values := records.Record().Values
-				// Create a map for the record values
-				product := map[string]any{
-					"name":  values[0],
-					"price": values[1],
-					"brand": values[2],
-				}
-				// Append the product map to the products slice
-				products = append(products, product)
-			}
-			if err := records.Err(); err != nil {
-				return nil, err
-			}
-			return products, nil
-		})
-		if err != nil {
-			return c.Status(500).SendString(err.Error())
-		}
-
-		return c.JSON(result)
-	})
-
-	log.Fatal(app.Listen(":8080"))
+type Neo4jClient struct {
+	driver neo4j.DriverWithContext
 }
 
-func connectToNeo4j() neo4j.DriverWithContext {
+func NewNeo4jClient() (*Neo4jClient, error) {
+	config := func(config *config.Config) {
+		config.MaxConnectionPoolSize = 100           
+		config.MaxConnectionLifetime = 1 * time.Hour
+		config.ConnectionAcquisitionTimeout = 2 * time.Minute 
+		config.ConnectionLivenessCheckTimeout = 2 * time.Second
+	}
 	driver, err := neo4j.NewDriverWithContext(
-		"neo4j://localhost:7687",
-		neo4j.BasicAuth("neo4j", os.Getenv("NEO4J_PASSWORD"), ""),
+		"neo4j://neo4j:7687",
+		neo4j.NoAuth(),
+		config,
 	)
 	if err != nil {
-		log.Fatalf("Failed to connect to Neo4j: %v", err)
+		return nil, fmt.Errorf("failed to create driver: %w", err)
 	}
-	return driver
+	ctx := context.Background()
+	if err := driver.VerifyConnectivity(ctx); err != nil {
+		driver.Close(ctx)
+		return nil, fmt.Errorf("failed to verify connectivity: %w", err)
+	}
+
+	return &Neo4jClient{driver: driver}, nil
+}
+
+func (c *Neo4jClient) Close(ctx context.Context) error {
+	return c.driver.Close(ctx)
+}
+
+// Example of a method using the connection pool
+func (c *Neo4jClient) CreatePerson(ctx context.Context, name string, age int) error {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{
+		DatabaseName: "neo4j",
+		AccessMode:   neo4j.AccessModeWrite,
+	})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		result, err := tx.Run(ctx,
+			"MERGE (p:Person {name: $name}) SET p.age = $age RETURN p",
+			map[string]any{
+				"name": name,
+				"age":  age,
+			})
+		if err != nil {
+			return nil, err
+		}
+		return result.Single(ctx)
+	})
+	return err
+}
+
+func main() {
+	client, err := NewNeo4jClient()
+	if err != nil {
+		log.Fatalf("Failed to create Neo4j client: %v", err)
+	}
+	ctx := context.Background()
+	defer client.Close(ctx)
+
+	// Example of concurrent operations using the connection pool
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("Person-%d", i)
+			err := client.CreatePerson(ctx, name, 25+i)
+			if err != nil {
+				log.Printf("Error creating person %s: %v", name, err)
+				return
+			}
+			log.Printf("Successfully created %s", name)
+		}(i)
+	}
+	wg.Wait()
+
+	fmt.Println("All operations completed")
 }
